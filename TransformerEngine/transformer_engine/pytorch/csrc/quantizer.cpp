@@ -1139,6 +1139,7 @@ NVFP4Quantizer::NVFP4Quantizer(const py::handle& quantizer) : Quantizer(quantize
   this->with_post_rht_amax = quantizer.attr("with_post_rht_amax").cast<bool>();
   this->with_2d_quantization = quantizer.attr("with_2d_quantization").cast<bool>();
   this->stochastic_rounding = quantizer.attr("stochastic_rounding").cast<bool>();
+  this->skip_amax = quantizer.attr("skip_amax").cast<bool>();
 
   // Get amax reduction group if needed for NVFP4 AG
   const bool with_amax_reduction = quantizer.attr("with_amax_reduction").cast<bool>();
@@ -1200,9 +1201,9 @@ std::pair<TensorWrapper, py::object> NVFP4Quantizer::create_tensor(const std::ve
                                                      rowwise_scale_inv_shape.end());
     rowwise_data_tensor = at::empty(convert_shape_for_fp4(shape_int64), bit8_tensor_opts);
     rowwise_scale_inv_tensor = at::empty(scale_inv_shape_int64, bit8_tensor_opts);
-    // hadamard amax kernel will zero out pointer with ZeroAmaxKernel
-    // nvte_compute_amax_with_config will zero out the pointer if needed
-    amax_rowwise = at::empty({1}, bit32_tensor_opts);
+    // Allocate amax tensor: init to 1.0 when skip_amax, otherwise empty (zeroed by kernel)
+    amax_rowwise = this->skip_amax ? at::full({1}, 1.0f, bit32_tensor_opts)
+                                   : at::empty({1}, bit32_tensor_opts);
   }
   if (columnwise_usage) {
     const std::vector<int64_t> scale_inv_shape_int64(columnwise_scale_inv_shape.begin(),
@@ -1215,9 +1216,9 @@ std::pair<TensorWrapper, py::object> NVFP4Quantizer::create_tensor(const std::ve
     columnwise_data_tensor =
         at::empty(convert_shape_for_fp4(transpose_shape_int64), bit8_tensor_opts);
     columnwise_scale_inv_tensor = at::empty(scale_inv_shape_int64, bit8_tensor_opts);
-    // hadamard amax kernel will zero out pointer with ZeroAmaxKernel
-    // nvte_compute_amax_with_config will zero out the pointer if needed
-    amax_columnwise = at::empty({1}, bit32_tensor_opts);
+    // Allocate amax tensor: init to 1.0 when skip_amax, otherwise empty (zeroed by kernel)
+    amax_columnwise = this->skip_amax ? at::full({1}, 1.0f, bit32_tensor_opts)
+                                      : at::empty({1}, bit32_tensor_opts);
   }
 
   // Convert tensors to Python
@@ -1356,9 +1357,7 @@ std::pair<TensorWrapper, py::object> NVFP4Quantizer::convert_and_update_tensor(
     }
     if (!amax_rowwise) {
       const auto opts = at::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-      // hadamard amax kernel will zero out pointer with ZeroAmaxKernel
-      // nvte_compute_amax_with_config will zero out the pointer if needed
-      amax_rowwise = at::empty({1}, opts);
+      amax_rowwise = this->skip_amax ? at::full({1}, 1.0f, opts) : at::empty({1}, opts);
       tensor.attr("_amax_rowwise") = *amax_rowwise;
     }
   } else {  // rowwise_usage == false
@@ -1398,9 +1397,7 @@ std::pair<TensorWrapper, py::object> NVFP4Quantizer::convert_and_update_tensor(
     }
     if (!amax_columnwise) {
       const auto opts = at::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA);
-      // hadamard amax kernel will zero out pointer with ZeroAmaxKernel
-      // nvte_compute_amax_with_config will zero out the pointer if needed
-      amax_columnwise = at::empty({1}, opts);
+      amax_columnwise = this->skip_amax ? at::full({1}, 1.0f, opts) : at::empty({1}, opts);
       tensor.attr("_amax_columnwise") = *amax_columnwise;
     }
   } else {  // columnwise_usage == false
@@ -1490,17 +1487,20 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
     if (input.dtype() != DType::kBFloat16) {
       NVTE_CHECK(false, "RHT is only supported for bfloat16 input");
     }
-    if (this->with_post_rht_amax) {
-      // We need:
-      // 1. Rowwise amax = amax for input
-      // 2. Columnwise amax = amax for RHT(input.t)
-      NVTE_SCOPED_GIL_RELEASE({
-        nvte_hadamard_transform_amax(input.data(), out.data(), 0,
-                                     this->rht_matrix_random_sign_mask_t, stream);
-      });
-    } else {
-      // raise error since it's not supported yet
-      NVTE_CHECK(false, "Pre-RHT amax is not supported yet");
+    // Only compute amax when not skipping
+    if (compute_amax) {
+      if (this->with_post_rht_amax) {
+        // We need:
+        // 1. Rowwise amax = amax for input
+        // 2. Columnwise amax = amax for RHT(input.t)
+        NVTE_SCOPED_GIL_RELEASE({
+          nvte_hadamard_transform_amax(input.data(), out.data(), 0,
+                                       this->rht_matrix_random_sign_mask_t, stream);
+        });
+      } else {
+        // raise error since it's not supported yet
+        NVTE_CHECK(false, "Pre-RHT amax is not supported yet");
+      }
     }
   } else {  // Without RHT
     if (compute_amax) {
@@ -1528,8 +1528,8 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
     }
   }
 
-  // amax reduction
-  if (this->with_amax_reduction) {
+  // amax reduction - only needed when actually computing amax
+  if (this->with_amax_reduction && compute_amax) {
     std::vector<at::Tensor> amax_tensors;
     // push amax tensors inside if they need to be reduced
     auto make_amax_tensor = [](void* data_ptr) {
@@ -1649,7 +1649,7 @@ void NVFP4Quantizer::quantize_impl(const TensorWrapper& input, TensorWrapper& ou
 
 void NVFP4Quantizer::quantize(const TensorWrapper& input, TensorWrapper& out,
                               const std::optional<TensorWrapper>& noop_flag) {
-  this->quantize_impl(input, out, noop_flag, true);
+  this->quantize_impl(input, out, noop_flag, !this->skip_amax);
 }
 
 void NVFP4Quantizer::quantize_with_amax(TensorWrapper& input, TensorWrapper& out) {

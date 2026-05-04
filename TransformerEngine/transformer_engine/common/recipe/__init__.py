@@ -65,6 +65,7 @@ class QParams:
     amax_epsilon: optional minimum value of abs max
     random_hadamard_transform: whether to use random hadamard transform
     stochastic_rounding: whether to use stocastic rounding
+    skip_amax: skip amax computation and use fixed scale (input must be in [-1, 1] range)
     """
 
     power_2_scale: bool = False
@@ -72,6 +73,7 @@ class QParams:
     random_hadamard_transform: bool = False
     stochastic_rounding: bool = False
     fp4_2d_quantization: bool = False
+    skip_amax: bool = False
 
     def __repr__(self) -> str:
         return (
@@ -79,7 +81,8 @@ class QParams:
             f"amax_epsilon={self.amax_epsilon},\n"
             f"random_hadamard_transform={self.random_hadamard_transform},\n"
             f"stochastic_rounding={self.stochastic_rounding},\n"
-            f"fp4_2d_quantization={self.fp4_2d_quantization}\n)"
+            f"fp4_2d_quantization={self.fp4_2d_quantization},\n"
+            f"skip_amax={self.skip_amax}\n)"
         )
 
 
@@ -428,6 +431,24 @@ class NVFP4BlockScaling(Recipe):
              If set to `True`, stochastic rounding is disabled during quantization for all tensors.
     disable_2d_quantization : bool, default = False
              If set to `True`, 1D block scaling with block size 16 is used for all tensors.
+    skip_amax : bool, default = False
+             If set to `True`, per-tensor amax computation is skipped and a fixed scale is used
+             for all cast types. Input data must be in the representable range [-1, 1] for
+             correct results. Can be overridden per cast type using the fields below or
+             environment variables ``NVTE_NVFP4_SKIP_AMAX_FWD_INP``,
+             ``NVTE_NVFP4_SKIP_AMAX_FWD_WEIGHT``, ``NVTE_NVFP4_SKIP_AMAX_BWD_GRAD``.
+    skip_amax_fwd_inp : Optional[bool], default = None
+             Per-cast-type override for skip_amax on forward input (activations).
+             When ``None``, falls back to env var ``NVTE_NVFP4_SKIP_AMAX_FWD_INP``,
+             then to the global ``skip_amax`` value.
+    skip_amax_fwd_weight : Optional[bool], default = None
+             Per-cast-type override for skip_amax on forward weight.
+             When ``None``, falls back to env var ``NVTE_NVFP4_SKIP_AMAX_FWD_WEIGHT``,
+             then to the global ``skip_amax`` value.
+    skip_amax_bwd_grad : Optional[bool], default = None
+             Per-cast-type override for skip_amax on backward gradient.
+             When ``None``, falls back to env var ``NVTE_NVFP4_SKIP_AMAX_BWD_GRAD``,
+             then to the global ``skip_amax`` value.
     """
 
     # Configuration envvars
@@ -436,6 +457,10 @@ class NVFP4BlockScaling(Recipe):
         os.getenv("NVTE_NVFP4_DISABLE_STOCHASTIC_ROUNDING", "0") == "1"
     )
     disable_2d_quantization: bool = os.getenv("NVTE_NVFP4_DISABLE_2D_QUANTIZATION", "0") == "1"
+    skip_amax: bool = os.getenv("NVTE_NVFP4_SKIP_AMAX", "0") == "1"
+    skip_amax_fwd_inp: Optional[bool] = None
+    skip_amax_fwd_weight: Optional[bool] = None
+    skip_amax_bwd_grad: Optional[bool] = None
 
     fp4_format: Format = Format.E2M1
     fp8_format: Format = Format.E4M3
@@ -448,6 +473,26 @@ class NVFP4BlockScaling(Recipe):
         assert self.fp4_format == Format.E2M1, "Only E2M1 is supported for NVFP4 scaling"
         assert self.fp8_format == Format.E4M3, "Only E4M3 is supported for NVFP4 scaling"
 
+        # Resolve per-cast-type skip_amax values.
+        # Priority: constructor arg > per-type env var > global skip_amax.
+        def _resolve_skip_amax(field_val, env_name):
+            if field_val is not None:
+                return field_val
+            env = os.getenv(env_name)
+            if env is not None:
+                return env == "1"
+            return self.skip_amax
+
+        _skip_fwd_inp = _resolve_skip_amax(
+            self.skip_amax_fwd_inp, "NVTE_NVFP4_SKIP_AMAX_FWD_INP"
+        )
+        _skip_fwd_weight = _resolve_skip_amax(
+            self.skip_amax_fwd_weight, "NVTE_NVFP4_SKIP_AMAX_FWD_WEIGHT"
+        )
+        _skip_bwd_grad = _resolve_skip_amax(
+            self.skip_amax_bwd_grad, "NVTE_NVFP4_SKIP_AMAX_BWD_GRAD"
+        )
+
         # Quantization params
         # Note: RHT is currently only applied to column-wise usage so that
         # it can be used for wgrad GEMM.
@@ -455,16 +500,19 @@ class NVFP4BlockScaling(Recipe):
             random_hadamard_transform=not self.disable_rht,
             stochastic_rounding=False,
             fp4_2d_quantization=False,
+            skip_amax=_skip_fwd_inp,
         )
         self.fp4_quant_fwd_weight = QParams(
             random_hadamard_transform=False,
             stochastic_rounding=False,
             fp4_2d_quantization=not self.disable_2d_quantization,
+            skip_amax=_skip_fwd_weight,
         )
         self.fp4_quant_bwd_grad = QParams(
             random_hadamard_transform=not self.disable_rht,
             stochastic_rounding=not self.disable_stochastic_rounding,
             fp4_2d_quantization=False,
+            skip_amax=_skip_bwd_grad,
         )
 
     def __repr__(self) -> str:
@@ -474,6 +522,10 @@ class NVFP4BlockScaling(Recipe):
             f"fp8_format={str(self.fp8_format).split('.')[1]}, "
             f"fp8_dpa={self.fp8_dpa}, "
             f"fp8_mha={self.fp8_mha}, "
+            f"skip_amax={self.skip_amax}, "
+            f"skip_amax_fwd_inp={self.skip_amax_fwd_inp}, "
+            f"skip_amax_fwd_weight={self.skip_amax_fwd_weight}, "
+            f"skip_amax_bwd_grad={self.skip_amax_bwd_grad}, "
             f"fp4_quant_fwd_inp={self.fp4_quant_fwd_inp}, "
             f"fp4_quant_fwd_weight={self.fp4_quant_fwd_weight}, "
             f"fp4_quant_bwd_grad={self.fp4_quant_bwd_grad}, "

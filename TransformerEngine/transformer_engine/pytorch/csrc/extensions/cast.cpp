@@ -596,6 +596,12 @@ std::tuple<std::vector<py::object>, std::vector<TensorWrapper>, bool> bulk_alloc
       amax_rowwise_list.emplace_back(
           make_torch_view(buffer, std::vector<size_t>{1}, amax_offsets[i], torch::kFloat32));
     }
+    // Initialize amax to 1.0 when skip_amax (matching single-tensor path behavior)
+    for (size_t i = 0; i < num_tensors; ++i) {
+      if (quantizer_cpp_list[i]->skip_amax) {
+        amax_rowwise_list[i].fill_(1.0f);
+      }
+    }
   }
 
   // Allocate column-wise data
@@ -657,6 +663,12 @@ std::tuple<std::vector<py::object>, std::vector<TensorWrapper>, bool> bulk_alloc
           make_torch_view(buffer, columnwise_scale_shapes[i], scale_offsets[i], torch::kUInt8));
       amax_columnwise_list.emplace_back(
           make_torch_view(buffer, std::vector<size_t>{1}, amax_offsets[i], torch::kFloat32));
+    }
+    // Initialize amax to 1.0 when skip_amax (matching single-tensor path behavior)
+    for (size_t i = 0; i < num_tensors; ++i) {
+      if (quantizer_cpp_list[i]->skip_amax) {
+        amax_columnwise_list[i].fill_(1.0f);
+      }
     }
   }
 
@@ -872,27 +884,32 @@ void split_quantize_nvfp4_impl(const TensorWrapper &input,
     });
 
   } else {  // NVFP4 quantize
-    // We need:
-    // 1. Rowwise amax = amax for input
-    // 2. Columnwise amax = amax for input too
-    // Columnwise amax will be filled with a fused D2D copy from rowwise amax
-    // Note that the multi compute amax API expects rowwise amax pointer to be not null
-    // So we need to set the pointer accordingly to make colwise-only quantization work
-    std::vector<void *> orig_amax_ptr_list;
-    for (size_t i = 0; i < num_tensors; i++) {
-      auto rowwise_amax_ptr = output_list[i].get_amax().data_ptr;
-      orig_amax_ptr_list.push_back(rowwise_amax_ptr);
-      auto columnwise_amax_ptr = output_list[i].get_columnwise_amax().data_ptr;
-      void *amax_ptr = rowwise_amax_ptr != nullptr ? rowwise_amax_ptr : columnwise_amax_ptr;
-      NVTE_CHECK(amax_ptr != nullptr, "Could not find amax pointer");
-      output_list[i].set_amax(amax_ptr, DType::kFloat32, std::vector<size_t>{1});
-    }
-    NVTE_SCOPED_GIL_RELEASE({
-      nvte_group_amax(input.data(), reinterpret_cast<NVTETensor *>(nvte_tensor_output_list.data()),
-                      split_sections.data(), num_tensors, stream);
-    });
-    for (size_t i = 0; i < num_tensors; i++) {
-      output_list[i].set_amax(orig_amax_ptr_list[i], DType::kFloat32, std::vector<size_t>{1});
+    // Check if amax computation should be skipped (all quantizers assumed identical config, line 738)
+    const bool compute_amax = !quantizers.front()->skip_amax;
+
+    if (compute_amax) {
+      // We need:
+      // 1. Rowwise amax = amax for input
+      // 2. Columnwise amax = amax for input too
+      // Columnwise amax will be filled with a fused D2D copy from rowwise amax
+      // Note that the multi compute amax API expects rowwise amax pointer to be not null
+      // So we need to set the pointer accordingly to make colwise-only quantization work
+      std::vector<void *> orig_amax_ptr_list;
+      for (size_t i = 0; i < num_tensors; i++) {
+        auto rowwise_amax_ptr = output_list[i].get_amax().data_ptr;
+        orig_amax_ptr_list.push_back(rowwise_amax_ptr);
+        auto columnwise_amax_ptr = output_list[i].get_columnwise_amax().data_ptr;
+        void *amax_ptr = rowwise_amax_ptr != nullptr ? rowwise_amax_ptr : columnwise_amax_ptr;
+        NVTE_CHECK(amax_ptr != nullptr, "Could not find amax pointer");
+        output_list[i].set_amax(amax_ptr, DType::kFloat32, std::vector<size_t>{1});
+      }
+      NVTE_SCOPED_GIL_RELEASE({
+        nvte_group_amax(input.data(), reinterpret_cast<NVTETensor *>(nvte_tensor_output_list.data()),
+                        split_sections.data(), num_tensors, stream);
+      });
+      for (size_t i = 0; i < num_tensors; i++) {
+        output_list[i].set_amax(orig_amax_ptr_list[i], DType::kFloat32, std::vector<size_t>{1});
+      }
     }
 
     // Quantize tensors individually

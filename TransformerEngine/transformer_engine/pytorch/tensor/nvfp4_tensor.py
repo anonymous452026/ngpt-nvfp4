@@ -143,6 +143,7 @@ class NVFP4Quantizer(Quantizer):
         with_2d_quantization: bool = False,
         stochastic_rounding: bool = False,
         with_random_sign_mask: bool = True,
+        skip_amax: bool = False,
     ) -> None:
         super().__init__(rowwise=rowwise, columnwise=columnwise)
         self.dtype = fp4_dtype
@@ -152,6 +153,7 @@ class NVFP4Quantizer(Quantizer):
         self.amax_reduction_group = amax_reduction_group
         self.with_2d_quantization = with_2d_quantization
         self.stochastic_rounding = stochastic_rounding
+        self.skip_amax = skip_amax
         self.rht_matrix_random_sign_mask_t = get_random_sign_mask_for_rht(
             with_random_sign_mask, torch.cuda.current_device()
         )
@@ -191,6 +193,7 @@ class NVFP4Quantizer(Quantizer):
             with_post_rht_amax=self.with_post_rht_amax,
             with_2d_quantization=self.with_2d_quantization,
             stochastic_rounding=self.stochastic_rounding,
+            skip_amax=self.skip_amax,
         )
         quantizer.internal = self.internal
         quantizer.rht_matrix = self.rht_matrix
@@ -321,8 +324,13 @@ class NVFP4Quantizer(Quantizer):
             scale_inv = torch.empty(
                 scale_shape, dtype=torch.uint8, device=device, pin_memory=pin_memory
             )
-            # Allocate per tensor scale inverse. FP32 format.
-            amax_rowwise = torch.zeros(1, dtype=torch.float32, device=device, pin_memory=pin_memory)
+            amax_rowwise = torch.full(
+                (1,),
+                1.0 if self.skip_amax else 0.0,
+                dtype=torch.float32,
+                device=device,
+                pin_memory=pin_memory,
+            )
 
         # Allocate FP8 data transpose if needed
         columnwise_data = None
@@ -342,8 +350,12 @@ class NVFP4Quantizer(Quantizer):
             columnwise_scale_inv = torch.empty(
                 columnwise_scale_shape, dtype=torch.uint8, device=device, pin_memory=pin_memory
             )
-            amax_columnwise = torch.zeros(
-                1, dtype=torch.float32, device=device, pin_memory=pin_memory
+            amax_columnwise = torch.full(
+                (1,),
+                1.0 if self.skip_amax else 0.0,
+                dtype=torch.float32,
+                device=device,
+                pin_memory=pin_memory,
             )
 
         # Construct FP8 tensor

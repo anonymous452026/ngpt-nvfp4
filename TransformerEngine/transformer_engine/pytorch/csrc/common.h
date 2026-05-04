@@ -296,6 +296,8 @@ class NVFP4Quantizer : public Quantizer {
   // 2D block scaling
   bool with_2d_quantization;
   bool stochastic_rounding;
+  // skip amax computation and use fixed scale
+  bool skip_amax;
 
   int rht_matrix_random_sign_mask_t;
   at::Tensor rht_matrix;

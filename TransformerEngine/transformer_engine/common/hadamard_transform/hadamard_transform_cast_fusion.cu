@@ -272,7 +272,9 @@ rht_gemm_device(MShape M, NShape N, KShape K, ClusterTileShape cluster_tile,
   bool is_epilogue_warp = (warp_idx >= 4 && warp_idx <= 7);
 
   if (is_epilogue_warp && elect_one_sync()) {
-    cute::prefetch(raw_pointer_cast(global_amax));
+    if (global_amax != nullptr) {
+      cute::prefetch(raw_pointer_cast(global_amax));
+    }
   }
 
   typename MainloopPipeline::Params mainloop_pipeline_params;
@@ -407,7 +409,7 @@ rht_gemm_device(MShape M, NShape N, KShape K, ClusterTileShape cluster_tile,
     accumulator_pipeline.producer_tail(accumulator_pipe_producer_state);
     tmem_allocator.free(tmem_base_ptr, TmemAllocator::Sm100TmemCapacityColumns);
   } else if (is_epilogue_warp) {
-    const float global_amax_val = *global_amax;
+    const float global_amax_val = (global_amax != nullptr) ? *global_amax : 0.0f;
     static constexpr int FragmentSize = 256 / sizeof_bits_v<TC>;
 
     tmem_allocation_result_barrier.arrive_and_wait();
