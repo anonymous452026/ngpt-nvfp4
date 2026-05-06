@@ -3,7 +3,7 @@ import copy
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Tuple, Union
-
+import os
 import torch
 from torch import Tensor
 
@@ -37,6 +37,7 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
+from megatron.core.transformer.utils import distributed_justnorm, justnorm, scaled_justnorm
 
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
@@ -258,6 +259,14 @@ class Attention(MegatronModule, ABC):
             # linear_proj to save the original input tensors to avoid the extra memory usage of
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
+
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            self.sqk_init_value = 1.0
+            self.sqk_init_scaling = config.init_method_std
+            tp_size = get_tensor_model_parallel_world_size()
+            sqk_size = self.query_projection_size // tp_size if tp_size > 1 else self.query_projection_size
+            self.sqk = torch.nn.Parameter(self.sqk_init_scaling * torch.ones(sqk_size, dtype=torch.float32))
+            self._sqk_scale_factor = (self.sqk_init_value / self.sqk_init_scaling) * (config.kv_channels ** 0.5)
 
     def _checkpointed_attention_forward(
         self,
@@ -934,6 +943,11 @@ class Attention(MegatronModule, ABC):
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
         nvtx_range_pop(suffix="rotary_pos_emb")
 
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            sqk = (self.sqk * self._sqk_scale_factor).view(1, 1, query.size(2), query.size(3))
+            query = scaled_justnorm(query, sqk)
+            key = justnorm(key)
+
         # ==================================
         # core attention computation
         # ==================================
@@ -988,6 +1002,9 @@ class Attention(MegatronModule, ABC):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
         nvtx_range_pop(suffix="core_attention")
+
+        if os.getenv('FNGPT', 'false').lower() == 'true':
+            core_attn_out = distributed_justnorm(core_attn_out, tp_group=get_tensor_model_parallel_group())
 
         # =================
         # Output. [sq, b, h]

@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Utilities for transformer layers."""
+import os
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
 
@@ -465,3 +466,180 @@ def is_layer_window_attention(
         f"Invalid `window_attn_skip_freq`: {type(window_attn_skip_freq)}, "
         f"{window_attn_skip_freq}"
     )
+
+def _justnorm_default(x:torch.Tensor, dim:int=-1, eps:float=1e-6) -> torch.Tensor:
+    dtype = x.dtype
+    x = x.float()
+    res = x / (x.norm(p=2, dim=dim, keepdim=True) + eps)
+    return res.to(dtype)
+
+def _justnorm_compiled_impl(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    x_fp32 = x.float()
+    x_squared = x_fp32.pow(2)
+    l2_norm_squared = x_squared.sum(dim=dim, keepdim=True)
+    rsqrt_norm = torch.rsqrt(l2_norm_squared + eps)
+    y_fp32 = x_fp32 * rsqrt_norm
+    return y_fp32.to(x.dtype)
+
+_justnorm_compiled = torch.compile(_justnorm_compiled_impl)
+
+def _slerp_norm_compiled_impl(
+    A: torch.Tensor, B: torch.Tensor, lr: torch.Tensor,
+    dim: int = -1, eps: float = 1e-6,
+) -> torch.Tensor:
+    A_fp32 = A.float()
+    B_fp32 = B.float()
+    A_norm = A_fp32 * torch.rsqrt(A_fp32.pow(2).sum(dim=dim, keepdim=True) + eps)
+    B_norm = B_fp32 * torch.rsqrt(B_fp32.pow(2).sum(dim=dim, keepdim=True) + eps)
+    slerps = A_norm + lr * (B_norm - A_norm)
+    result = slerps * torch.rsqrt(slerps.pow(2).sum(dim=dim, keepdim=True) + eps)
+    return result.to(A.dtype)
+
+slerp_norm_compiled = torch.compile(_slerp_norm_compiled_impl)
+
+# NVTE_JUSTNORM_MODE: "default" (original), "compile" (torch.compile), "fused" (compile + fused slerp)
+_JUSTNORM_MODE = os.environ.get('NVTE_JUSTNORM_MODE', 'default')
+
+def justnorm(x:torch.Tensor, dim:int=-1, eps:float=1e-6) -> torch.Tensor:
+    if _JUSTNORM_MODE == 'triton':
+        from megatron.core.fusions.fused_l2norm import fused_l2norm
+        return fused_l2norm(x, dim=dim, eps=eps)
+    elif _JUSTNORM_MODE == 'default':
+        return _justnorm_default(x, dim=dim, eps=eps)
+    else:
+        return _justnorm_compiled(x, dim=dim, eps=eps)
+
+class _DistributedJustnormPytorch(torch.autograd.Function):
+    """Autograd-correct distributed L2 norm using PyTorch ops + NCCL all-reduce.
+
+    Forward:  local_ss = sum(x^2) per row → all-reduce → y = x * rnorm
+    Backward: local_dot = sum(dy*y) per row → all-reduce → dx = (dy - y*dot) * rnorm
+    """
+
+    @staticmethod
+    def forward(ctx, x, eps, tp_group):
+        dtype = x.dtype
+        x_f = x.float()
+        local_ss = (x_f * x_f).sum(dim=-1, keepdim=True)
+        torch.distributed.all_reduce(local_ss, group=tp_group)
+        rnorm = 1.0 / (local_ss.sqrt() + eps)
+        y = x_f * rnorm
+        ctx.save_for_backward(y.to(dtype), rnorm)
+        ctx.tp_group = tp_group
+        return y.to(dtype)
+
+    @staticmethod
+    def backward(ctx, dy):
+        y, rnorm = ctx.saved_tensors
+        dy_f = dy.float()
+        y_f = y.float()
+        local_dot = (dy_f * y_f).sum(dim=-1, keepdim=True)
+        torch.distributed.all_reduce(local_dot, group=ctx.tp_group)
+        dx = (dy_f - y_f * local_dot) * rnorm
+        return dx.to(dy.dtype), None, None
+
+
+def distributed_justnorm(
+    x: torch.Tensor,
+    dim: int = -1,
+    eps: float = 1e-6,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """L2 normalization with all-reduce for tensor-parallel partitioned tensors.
+
+    When TP world size <= 1, falls through to justnorm() which respects
+    NVTE_JUSTNORM_MODE dispatch (default/compile/triton/fused).
+
+    When TP world size > 1, uses fused Triton kernels (if NVTE_JUSTNORM_MODE=triton)
+    or plain PyTorch for: local sum-of-squares -> all-reduce -> normalize with global norm.
+    Both forward and backward are TP-correct (backward all-reduces dot products too).
+    """
+    if tp_group is None:
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+    if tp_group is None or torch.distributed.get_world_size(tp_group) <= 1:
+        return justnorm(x, dim=dim, eps=eps)
+
+    # TP > 1: use Triton fused kernels if available
+    if _JUSTNORM_MODE == 'triton':
+        from megatron.core.fusions.fused_l2norm import fused_distributed_l2norm
+        return fused_distributed_l2norm(x, tp_group, dim=dim, eps=eps)
+
+    # Default/compile fallback for TP > 1 — use autograd Function for correct backward
+    return _DistributedJustnormPytorch.apply(x, eps, tp_group)
+
+
+def slerp_norm(A: torch.Tensor, B: torch.Tensor, lr: torch.Tensor,
+               dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    if _JUSTNORM_MODE == 'triton':
+        from megatron.core.fusions.fused_l2norm import fused_slerp_l2norm
+        return fused_slerp_l2norm(A, B, lr, dim=dim, eps=eps)
+    elif _JUSTNORM_MODE == 'fused':
+        return slerp_norm_compiled(A, B, lr, dim=dim, eps=eps)
+    else:
+        A_norm = justnorm(A, dim=dim, eps=eps)
+        B_norm = justnorm(B, dim=dim, eps=eps)
+        slerps = A_norm + lr * (B_norm - A_norm)
+        return justnorm(slerps, dim=dim, eps=eps)
+
+
+def scaled_justnorm(x: torch.Tensor, scale: torch.Tensor,
+                    dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    """Scaled L2 normalization: scale^2 * l2norm(x).
+
+    Optimization #6: In Triton mode, fuses scale^2 * l2norm(x) into one kernel.
+
+    Args:
+        x: Input tensor.
+        scale: Scale parameter (scalar or per-hidden-dim vector).
+        dim: Dimension to normalize over.
+        eps: Small constant for numerical stability.
+
+    Returns:
+        Scaled and normalized tensor.
+    """
+    if _JUSTNORM_MODE == 'triton':
+        from megatron.core.fusions.fused_l2norm import fused_scaled_l2norm
+        return fused_scaled_l2norm(x, scale, dim=dim, eps=eps)
+    else:
+        return scale.square() * justnorm(x, dim=dim, eps=eps)
+
+
+def suv_scale(x: torch.Tensor, suv_param: torch.Tensor,
+              scale_factor: float) -> torch.Tensor:
+    """Fused SUV scaling: y = (suv_param * scale_factor) * x.
+
+    In Triton mode, fuses param*scalar + broadcast*activation into one kernel.
+    Falls back to PyTorch ops otherwise.
+    """
+    if _JUSTNORM_MODE == 'triton':
+        from megatron.core.fusions.fused_l2norm import fused_suv_scale
+        return fused_suv_scale(x, suv_param, scale_factor)
+    else:
+        suv = suv_param * scale_factor
+        return suv * x
+
+
+def slerp_norm_with_alpha(A: torch.Tensor, B: torch.Tensor,
+                          alpha_param: torch.Tensor, alpha_scale: torch.Tensor,
+                          dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    """SLERP L2 normalization with inline alpha computation.
+
+    Optimization #7: In Triton mode, computes lr = abs(alpha * alpha_scale) inside kernel.
+
+    Args:
+        A: First input tensor.
+        B: Second input tensor.
+        alpha_param: Alpha parameter tensor.
+        alpha_scale: Precomputed alpha scaling factor.
+        dim: Dimension to normalize over.
+        eps: Small constant for numerical stability.
+
+    Returns:
+        SLERP-interpolated and normalized tensor.
+    """
+    if _JUSTNORM_MODE == 'triton':
+        from megatron.core.fusions.fused_l2norm import fused_slerp_l2norm_with_alpha
+        return fused_slerp_l2norm_with_alpha(A, B, alpha_param, alpha_scale, dim=dim, eps=eps)
+    else:
+        lr = torch.abs(alpha_param * alpha_scale)
+        return slerp_norm(A, B, lr, dim=dim, eps=eps)

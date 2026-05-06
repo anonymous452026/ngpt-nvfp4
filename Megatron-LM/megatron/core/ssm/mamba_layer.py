@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple, Union
 
@@ -19,6 +20,7 @@ from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import slerp_norm_with_alpha
 from megatron.core.utils import deprecate_inference_params
 
 
@@ -84,6 +86,18 @@ class MambaLayer(GraphableMegatronModule):
         self.mamba_bda = build_module(submodules.mamba_bda)
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            for p in self.norm.parameters():
+                p.requires_grad = False
+            self.mixer_alpha_init_value = float(os.getenv('NGPT_ALPHA_INIT', '0.05'))
+            self.mixer_alpha_init_scaling = config.init_method_std
+            self.mixer_alpha = torch.nn.Parameter(
+                self.mixer_alpha_init_scaling * torch.ones(
+                    self.config.hidden_size, dtype=torch.float32
+                )
+            )
+            self._mixer_alpha_scale = self.mixer_alpha_init_value / self.mixer_alpha_init_scaling
+
     def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
         """Returns the Mamba conv and ssm states shapes per request."""
         return self.mixer.mamba_state_shapes_per_request()
@@ -117,19 +131,28 @@ class MambaLayer(GraphableMegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        residual = hidden_states
-        if self.residual_in_fp32:
-            residual = residual.to(torch.float32)
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            # NGPT: bypass layernorm, use slerp residual
+            hidden_states_input = hidden_states.to(dtype=self.config.params_dtype)
+            mixer_out_with_bias = self.mixer(hidden_states_input, inference_context=inference_context)
+            hidden_states = slerp_norm_with_alpha(
+                hidden_states, mixer_out_with_bias[0],
+                self.mixer_alpha, self._mixer_alpha_scale
+            )
+        else:
+            residual = hidden_states
+            if self.residual_in_fp32:
+                residual = residual.to(torch.float32)
 
-        hidden_states = hidden_states.to(dtype=self.config.params_dtype)
-        hidden_states = self.norm(hidden_states)
+            hidden_states = hidden_states.to(dtype=self.config.params_dtype)
+            hidden_states = self.norm(hidden_states)
 
-        mixer_out_with_bias = self.mixer(hidden_states, inference_context=inference_context)
+            mixer_out_with_bias = self.mixer(hidden_states, inference_context=inference_context)
 
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.mamba_bda(
-                training=self.training, fused=self.config.bias_dropout_fusion
-            )(mixer_out_with_bias, residual, self.hidden_dropout)
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = self.mamba_bda(
+                    training=self.training, fused=self.config.bias_dropout_fusion
+                )(mixer_out_with_bias, residual, self.hidden_dropout)
 
         return hidden_states
 

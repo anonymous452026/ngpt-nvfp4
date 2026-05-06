@@ -3,7 +3,7 @@ import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import List, Optional, Union
-
+import os
 import torch
 from torch import Tensor
 
@@ -371,18 +371,21 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             ]
         )
 
-        # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
-        # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
-        # self.post_process and self.post_layer_norm guide this behavior
-        if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
-            self.final_layernorm = build_module(
-                self.submodules.layer_norm,
-                config=self.config,
-                hidden_size=self.config.hidden_size,
-                eps=self.config.layernorm_epsilon,
-            )
+        if os.getenv('NGPT', 'false').lower() == 'true': # NOTE: Disable all layernorms.
+            self.final_layernorm = None
         else:
-            self.final_layernorm = None  # Either this or nn.Identity
+            # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
+            # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
+            # self.post_process and self.post_layer_norm guide this behavior
+            if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
+                self.final_layernorm = build_module(
+                    self.submodules.layer_norm,
+                    config=self.config,
+                    hidden_size=self.config.hidden_size,
+                    eps=self.config.layernorm_epsilon,
+                )
+            else:
+                self.final_layernorm = None  # Either this or nn.Identity
 
         if self.config.inference_fuse_tp_communication:
             self._setup_fused_tp_communication()
@@ -744,15 +747,18 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     ):
                         hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
 
-        # Final layer norm.
-        if self.final_layernorm is not None:
-            hidden_states = self.final_layernorm(hidden_states)
-            # TENorm produces a "viewed" tensor. This will result in schedule.py's
-            # deallocate_output_tensor() throwing an error, so a viewless tensor is
-            # created to prevent this.
-            hidden_states = make_viewless_tensor(
-                inp=hidden_states, requires_grad=True, keep_graph=True
-            )
+        if os.getenv('NGPT', 'false').lower() == 'true': # NOTE: Disable all layernorms.
+            pass
+        else:
+            # Final layer norm.
+            if self.final_layernorm is not None:
+                hidden_states = self.final_layernorm(hidden_states)
+                # TENorm produces a "viewed" tensor. This will result in schedule.py's
+                # deallocate_output_tensor() throwing an error, so a viewless tensor is
+                # created to prevent this.
+                hidden_states = make_viewless_tensor(
+                    inp=hidden_states, requires_grad=True, keep_graph=True
+                )
 
         # If this TransformerBlock is empty, input and output hidden states will be the same node
         # on the computational graph and will lead to unexpected errors in pipeline schedules.

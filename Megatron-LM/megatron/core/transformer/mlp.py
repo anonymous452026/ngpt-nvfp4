@@ -1,5 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
+import os
 import gc
 import logging
 import warnings
@@ -30,6 +30,13 @@ from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
     nvtx_range_pop,
     nvtx_range_push,
+)
+from megatron.core.parallel_state import get_tensor_model_parallel_world_size
+from megatron.core.transformer.utils import (
+    distributed_justnorm,
+    ensure_metadata_has_dp_cp_group,
+    make_sharded_tensors_for_checkpoint,
+    suv_scale,
 )
 
 try:
@@ -148,12 +155,23 @@ class MLP(MegatronModule):
             tp_group=tp_group,
         )
 
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            self.suv_init_value = 1.0
+            self.suv_init_scaling = 1.0
+            tp_size = get_tensor_model_parallel_world_size()
+            suv_size = ffn_hidden_size // tp_size if tp_size > 1 else ffn_hidden_size
+            self.suv = torch.nn.Parameter(self.suv_init_scaling * torch.ones(suv_size, dtype=torch.float32))
+            self._suv_scale_factor = (self.suv_init_value / self.suv_init_scaling) * (self.config.hidden_size ** 0.5)
+
     def forward(self, hidden_states, per_token_scale=None):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
         nvtx_range_push(suffix="linear_fc1")
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
+
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            intermediate_parallel = suv_scale(intermediate_parallel, self.suv, self._suv_scale_factor)
 
         nvtx_range_push(suffix="activation")
         if self.config.use_te_activation_func:
@@ -231,6 +249,9 @@ class MLP(MegatronModule):
                 intermediate_parallel = intermediate_parallel.to(original_dtype)
         nvtx_range_pop(suffix="activation")
 
+        if os.getenv('FNGPT', 'false').lower() == 'true':
+            intermediate_parallel = distributed_justnorm(intermediate_parallel)
+
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
 
@@ -251,6 +272,21 @@ class MLP(MegatronModule):
     ) -> ShardedStateDict:
         """Return the sharded state dictionary of the module."""
         sharded_state_dict = {}
+        own_params = {}
+        self._save_to_state_dict(own_params, '', keep_vars=True)
+        if own_params:
+            metadata = ensure_metadata_has_dp_cp_group(metadata)
+            tp_group = getattr(self, 'tp_group', None) or get_tensor_model_parallel_group_if_none(None)
+            sharded_state_dict.update(
+                make_sharded_tensors_for_checkpoint(
+                    own_params,
+                    prefix,
+                    sharded_offsets=sharded_offsets,
+                    tp_group=tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
+                )
+            )
+
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         for name, module in self._modules.items():
             sub_sd = module.sharded_state_dict(f"{prefix}{name}.", sharded_offsets, metadata)

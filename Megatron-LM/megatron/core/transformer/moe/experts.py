@@ -1,5 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-
+import os
 import copy
 import logging
 from copy import deepcopy
@@ -42,9 +42,11 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
     make_sharded_object_for_checkpoint,
+    make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
 from megatron.core.utils import deprecated
+from megatron.core.transformer.utils import distributed_justnorm
 
 try:
     import transformer_engine as te  # pylint: disable=unused-import
@@ -632,6 +634,14 @@ class TEGroupedMLP(MegatronModule):
             self.quantization_padding = Fp8Padding(self.num_local_experts)
             self.quantization_unpadding = Fp8Unpadding(self.num_local_experts)
 
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            self.suv_init_value = 1.0
+            self.suv_init_scaling = 1.0
+            # Use expert TP size (not global TP) since MoE experts may not be TP-sharded
+            etp_size = parallel_state.get_expert_tensor_parallel_world_size()
+            suv_size = ffn_hidden_size // etp_size if etp_size > 1 else ffn_hidden_size
+            self.suv = torch.nn.Parameter(self.suv_init_scaling * torch.ones(suv_size, dtype=torch.float32))
+
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
         if bias_parallel is None:
@@ -691,9 +701,16 @@ class TEGroupedMLP(MegatronModule):
             # Probs already applied, so reset to 1.
             permuted_probs = torch.ones_like(permuted_probs)
 
+        apply_probs_on_output = os.getenv('FNGPT', 'false').lower() == 'true'
+        act_probs = torch.ones_like(permuted_probs) if apply_probs_on_output else permuted_probs
+
         intermediate_parallel, bias_parallel = self.linear_fc1(
             permuted_local_hidden_states, tokens_per_expert
         )
+
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            suv = (self.suv * ((self.suv_init_value / self.suv_init_scaling) * (self.config.hidden_size ** 0.5)))
+            intermediate_parallel = suv * intermediate_parallel
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
             if self.config.use_te_activation_func:
@@ -756,15 +773,27 @@ class TEGroupedMLP(MegatronModule):
         if self.activation_recompute:
             self.activation_checkpoint = tensor_parallel.CheckpointWithoutOutput()
             intermediate_parallel = self.activation_checkpoint.checkpoint(
-                bias_act_func, intermediate_parallel, bias_parallel, permuted_probs
+                bias_act_func, intermediate_parallel, bias_parallel, act_probs
             )
             output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
+            if apply_probs_on_output:
+                output = (output * permuted_probs).to(output.dtype)
             self.activation_checkpoint.discard_output_and_register_recompute(output)
         else:
             intermediate_parallel = bias_act_func(
-                intermediate_parallel, bias_parallel, permuted_probs
+                intermediate_parallel, bias_parallel, act_probs
             )
+
+            if os.getenv('FNGPT', 'false').lower() == 'true':
+                etp_group = parallel_state.get_expert_tensor_parallel_group()
+                intermediate_parallel = distributed_justnorm(
+                    intermediate_parallel, tp_group=etp_group
+                )
+
             output, output_bias = self.linear_fc2(intermediate_parallel, tokens_per_expert)
+
+            if apply_probs_on_output:
+                output = (output * permuted_probs).to(output.dtype)
 
         # upad and concat the output
         if self.config.fp8 or self.config.fp4:
@@ -786,6 +815,18 @@ class TEGroupedMLP(MegatronModule):
         metadata = ensure_metadata_has_dp_cp_group(metadata)
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
+        own_params = {}
+        self._save_to_state_dict(own_params, '', keep_vars=True)
+        if own_params:
+            sharded_state_dict.update(
+                make_sharded_tensors_for_checkpoint(
+                    own_params,
+                    prefix,
+                    sharded_offsets=sharded_offsets,
+                    tp_group=self.tp_group,
+                    dp_cp_group=metadata['dp_cp_group'],
+                )
+            )
         for name, module in self._modules.items():
             sub_sd = sharded_state_dict_default(
                 module, f'{name}.', sharded_offsets, metadata, tp_group=self.tp_group

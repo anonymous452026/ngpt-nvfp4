@@ -1,5 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
+import os
 import warnings
 from typing import Optional, Tuple
 
@@ -20,6 +20,7 @@ from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParall
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
 from megatron.core.utils import get_te_version, is_te_min_version
+from megatron.core.transformer.identity_op import IdentityOp
 
 
 class TESpecProvider(BackendSpecProvider):
@@ -39,7 +40,10 @@ class TESpecProvider(BackendSpecProvider):
 
     def fuse_layernorm_and_linear(self) -> bool:
         """TE backend chooses a single module for layernorm and linear"""
-        return True
+        if os.getenv('NGPT', 'false').lower() == 'true': # NOTE: Disable all layernorms.
+            return False
+        else:
+            return True
 
     def column_parallel_layer_norm_linear(self) -> Optional[type]:
         """Which module for sequential layernorm and linear"""
@@ -52,7 +56,10 @@ class TESpecProvider(BackendSpecProvider):
             # for QKLayerNorm if TE Version < 1.9;
             # we instead use the Apex implementation.
             return FusedLayerNorm
-        return TENorm
+        if os.getenv('NGPT', 'false').lower() == 'true': # NOTE: Disable all layernorms.
+            return IdentityOp
+        else:
+            return TENorm
 
     def core_attention(self) -> type:
         """Which module to use for attention"""

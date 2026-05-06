@@ -110,6 +110,7 @@ from megatron.core.parallel_state import (
     destroy_model_parallel,
     update_pg_timeout
 )
+from megatron.core.transformer.utils import justnorm
 
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
@@ -1339,6 +1340,268 @@ def dummy_train_step(data_iterator):
             batch = get_batch_on_this_cp_rank(batch)
 
 
+_ngpt_weight_norm_plan = {}  # Module-level cache: optimizer id -> plan
+_ngpt_weight_norm_logged_paths = set()
+
+
+def _ngpt_log_weight_norm_path(path):
+    """Log the selected nGPT weight-normalization path once per process."""
+    if path not in _ngpt_weight_norm_logged_paths:
+        print_rank_0(f'nGPT weight norm path: {path}')
+        _ngpt_weight_norm_logged_paths.add(path)
+
+
+def _ngpt_build_plan(model, tmp_optimizer, config):
+    """One-time setup: build the cached plan for _ngpt_weight_norm_distributed.
+
+    Returns a dict with:
+        dp_group: the data-parallel process group
+        total_ss_size: length of the sum-of-squares buffer
+        ss_buffer: pre-allocated persistent buffer (avoids re-alloc each step)
+        fast_shards: list of shard tensors (complete-row shards)
+        fast_ss_row_indices_parts: per-shard metadata for SS scatter
+        slow_plan: list of (shard_fp32, axis, ss_offset, out_dim, in_dim, positions)
+    """
+    dp_group = tmp_optimizer.data_parallel_group
+
+    # Build model_param -> (shard_fp32, param_range) mapping
+    model_param_to_shard = {}
+    for i in range(len(tmp_optimizer.shard_fp32_from_float16_groups)):
+        for j in range(len(tmp_optimizer.shard_fp32_from_float16_groups[i])):
+            shard_fp32 = tmp_optimizer.shard_fp32_from_float16_groups[i][j]
+            model_param = tmp_optimizer.model_float16_groups[i][j]
+            if shard_fp32 is None:
+                continue
+            param_range = tmp_optimizer._get_model_param_range_map(model_param)["param"]
+            model_param_to_shard[model_param] = (shard_fp32, param_range)
+
+    # Build canonical param list (same order on all ranks)
+    tmp_model = model[0].module.module
+    canonical_params = []
+    canonical_params.append((tmp_model.embedding.word_embeddings.weight, 1))
+    canonical_params.append((tmp_model.output_layer.weight, 1))
+    for layer_idx in range(config.num_layers):
+        block = tmp_model.decoder.layers[layer_idx]
+
+        if hasattr(block, 'self_attention') and hasattr(block.self_attention, 'linear_qkv'):
+            canonical_params.append((block.self_attention.linear_qkv.weight, 1))
+            canonical_params.append((block.self_attention.linear_proj.weight, 0))
+
+        if hasattr(block, 'mlp'):
+            if hasattr(block.mlp, 'experts'):
+                num_local = block.mlp.experts.num_local_experts
+                for expert in range(num_local):
+                    canonical_params.append(
+                        (block.mlp.experts.linear_fc1.__getattr__(f'weight{expert}'), 1)
+                    )
+                    canonical_params.append(
+                        (block.mlp.experts.linear_fc2.__getattr__(f'weight{expert}'), 0)
+                    )
+                if hasattr(block.mlp, 'shared_experts'):
+                    canonical_params.append((block.mlp.shared_experts.linear_fc1.weight, 1))
+                    canonical_params.append((block.mlp.shared_experts.linear_fc2.weight, 0))
+            elif hasattr(block.mlp, 'linear_fc1'):
+                canonical_params.append((block.mlp.linear_fc1.weight, 1))
+                canonical_params.append((block.mlp.linear_fc2.weight, 0))
+
+        if hasattr(block, 'mixer') and hasattr(block.mixer, 'in_proj'):
+            canonical_params.append((block.mixer.in_proj.weight, 1))
+            canonical_params.append((block.mixer.out_proj.weight, 0))
+
+    # Compute buffer layout and separate fast vs slow paths
+    device = torch.cuda.current_device()
+    total_ss_size = 0
+    fast_shards = []
+    fast_ss_row_indices_parts = []   # for sum-of-squares scatter
+    slow_plan = []
+
+    for model_param, axis in canonical_params:
+        out_dim, in_dim = model_param.shape[0], model_param.shape[1]
+        norm_size = out_dim if axis == 1 else in_dim
+        ss_offset = total_ss_size
+        total_ss_size += norm_size
+
+        if model_param not in model_param_to_shard:
+            continue
+
+        shard_fp32, param_range = model_param_to_shard[model_param]
+        is_fast = (param_range.start % in_dim == 0 and param_range.size % in_dim == 0)
+
+        if is_fast:
+            num_local_rows = param_range.size // in_dim
+            row_start = param_range.start // in_dim
+
+            fast_shards.append(shard_fp32)
+
+            # SS indices: one index per local row, pointing into ss_buffer
+            if axis == 1:
+                # Row norm: each row gets its own norm → ss_offset + row_start + i
+                ss_idx = torch.arange(num_local_rows, device=device, dtype=torch.int64) + (ss_offset + row_start)
+            else:
+                # Col norm: all rows contribute to the same set of in_dim norms
+                # We'll handle col norm SS differently (sum dim=0 then write)
+                ss_idx = torch.arange(in_dim, device=device, dtype=torch.int64) + ss_offset
+            fast_ss_row_indices_parts.append((axis, ss_idx, num_local_rows, in_dim, ss_offset, row_start))
+        else:
+            positions = torch.arange(param_range.start, param_range.end, device=device)
+            slow_plan.append((shard_fp32, axis, ss_offset, out_dim, in_dim, positions))
+
+    ss_buffer = torch.zeros(total_ss_size, device=device, dtype=torch.float32)
+
+    return {
+        'dp_group': dp_group,
+        'total_ss_size': total_ss_size,
+        'ss_buffer': ss_buffer,
+        'fast_shards': fast_shards,
+        'fast_ss_row_indices_parts': fast_ss_row_indices_parts,
+        'slow_plan': slow_plan,
+    }
+
+
+def _ngpt_weight_norm_distributed(model, tmp_optimizer, config):
+    """Apply nGPT weight normalization for distributed optimizer (synchronous).
+
+    Computes local sum-of-squares on FP32 shards, all-reduces across DP ranks,
+    then normalizes each shard by the global L2 norm.
+    """
+    global _ngpt_weight_norm_plan
+    opt_id = id(tmp_optimizer)
+    if opt_id not in _ngpt_weight_norm_plan:
+        _ngpt_weight_norm_plan[opt_id] = _ngpt_build_plan(model, tmp_optimizer, config)
+
+    p = _ngpt_weight_norm_plan[opt_id]
+    ss_buffer = p['ss_buffer']
+
+    # Zero the persistent buffer (single kernel)
+    ss_buffer.zero_()
+
+    # --- Fast path: batched sum-of-squares ---
+    if p['fast_shards']:
+        flat_shards = torch.cat(p['fast_shards'])
+        flat_sq = flat_shards * flat_shards
+
+        offset = 0
+        for axis, ss_idx, num_rows, in_dim, ss_offset, row_start in p['fast_ss_row_indices_parts']:
+            shard_size = num_rows * in_dim
+            shard_sq = flat_sq[offset : offset + shard_size].view(num_rows, in_dim)
+            if axis == 1:
+                row_ss = shard_sq.sum(dim=1)
+                ss_buffer[ss_idx] += row_ss
+            else:
+                col_ss = shard_sq.sum(dim=0)
+                ss_buffer[ss_idx] += col_ss
+            offset += shard_size
+
+    # --- Slow path: individual shards with partial rows ---
+    for shard_fp32, axis, ss_offset, out_dim, in_dim, positions in p['slow_plan']:
+        if axis == 1:
+            row_indices = positions // in_dim
+            local_ss = torch.zeros(out_dim, device=shard_fp32.device, dtype=torch.float32)
+            local_ss.scatter_add_(0, row_indices, shard_fp32 * shard_fp32)
+            ss_buffer[ss_offset : ss_offset + out_dim] += local_ss
+        else:
+            col_indices = positions % in_dim
+            local_ss = torch.zeros(in_dim, device=shard_fp32.device, dtype=torch.float32)
+            local_ss.scatter_add_(0, col_indices, shard_fp32 * shard_fp32)
+            ss_buffer[ss_offset : ss_offset + in_dim] += local_ss
+
+    # --- Synchronous all-reduce ---
+    torch.distributed.all_reduce(
+        ss_buffer, op=torch.distributed.ReduceOp.SUM, group=p['dp_group']
+    )
+
+    eps = 1e-6
+
+    # --- Compute global norms (single kernel over entire buffer) ---
+    global_norms = torch.sqrt(ss_buffer) + eps
+
+    # --- Fast path: batched normalization ---
+    if p['fast_shards']:
+        for shard, (axis, ss_idx, num_rows, in_dim, ss_offset, row_start) in zip(
+                p['fast_shards'], p['fast_ss_row_indices_parts']):
+            local_matrix = shard.view(num_rows, in_dim)
+            if axis == 1:
+                row_norms = global_norms[ss_offset + row_start : ss_offset + row_start + num_rows]
+                local_matrix.div_(row_norms.unsqueeze(1))
+            else:
+                col_norms = global_norms[ss_offset : ss_offset + in_dim]
+                local_matrix.div_(col_norms.unsqueeze(0))
+
+    # --- Slow path: individual normalization ---
+    for shard_fp32, axis, ss_offset, out_dim, in_dim, positions in p['slow_plan']:
+        if axis == 1:
+            row_indices = positions // in_dim
+            shard_fp32.div_(global_norms[ss_offset:][row_indices])
+        else:
+            col_indices = positions % in_dim
+            shard_fp32.div_(global_norms[ss_offset:][col_indices])
+
+    # Copy normalized FP32 shards to param buffer for the upcoming all-gather.
+    tmp_optimizer._copy_main_params_to_model_params()
+
+
+def _ngpt_weight_norm_full_params(model, optimizer, config):
+    """Apply nGPT weight normalization to full FP32 master params.
+
+    This path is used by non-distributed optimizers whose child optimizers own full
+    parameters instead of DistributedOptimizer flat shards.
+    """
+    tmp_model = model[0].module.module
+    data_ptr_to_axes = {}
+
+    data_ptr_to_axes[tmp_model.embedding.word_embeddings.weight.data_ptr()] = 1
+    data_ptr_to_axes[tmp_model.output_layer.weight.data_ptr()] = 1
+
+    for layer_idx in range(0, config.num_layers):
+        block = tmp_model.decoder.layers[layer_idx]
+
+        # Transformer attention weights
+        if hasattr(block, 'self_attention') and hasattr(block.self_attention, 'linear_qkv'):
+            data_ptr_to_axes[block.self_attention.linear_qkv.weight.data_ptr()] = 1
+            data_ptr_to_axes[block.self_attention.linear_proj.weight.data_ptr()] = 0
+
+        # MLP / MoE weights
+        if hasattr(block, 'mlp') and hasattr(block.mlp, 'experts'):
+            num_local = block.mlp.experts.num_local_experts
+            for expert in range(num_local):
+                data_ptr_to_axes[
+                    block.mlp.experts.linear_fc1.__getattr__(f'weight{expert}').data_ptr()
+                ] = 1
+                data_ptr_to_axes[
+                    block.mlp.experts.linear_fc2.__getattr__(f'weight{expert}').data_ptr()
+                ] = 0
+            if hasattr(block.mlp, 'shared_experts'):
+                data_ptr_to_axes[block.mlp.shared_experts.linear_fc1.weight.data_ptr()] = 1
+                data_ptr_to_axes[block.mlp.shared_experts.linear_fc2.weight.data_ptr()] = 0
+        elif hasattr(block, 'mlp') and hasattr(block.mlp, 'linear_fc1'):
+            data_ptr_to_axes[block.mlp.linear_fc1.weight.data_ptr()] = 1
+            data_ptr_to_axes[block.mlp.linear_fc2.weight.data_ptr()] = 0
+
+        # Mamba mixer weights
+        if hasattr(block, 'mixer') and hasattr(block.mixer, 'in_proj'):
+            data_ptr_to_axes[block.mixer.in_proj.weight.data_ptr()] = 1
+            data_ptr_to_axes[block.mixer.out_proj.weight.data_ptr()] = 0
+
+    changed_any = False
+    for tmp_optimizer in optimizer.chained_optimizers:
+        if not hasattr(tmp_optimizer, 'fp32_from_float16_groups'):
+            continue  # skip FP32Optimizer (no bf16 master weights)
+        optimizer_tensors = tmp_optimizer.fp32_from_float16_groups
+        model_tensors = tmp_optimizer.float16_groups
+        changed = False
+        for i in range(len(optimizer_tensors)):
+            for j in range(len(optimizer_tensors[i])):
+                if model_tensors[i][j].data_ptr() in data_ptr_to_axes.keys():
+                    axes = data_ptr_to_axes[model_tensors[i][j].data_ptr()]
+                    optimizer_tensors[i][j].data.copy_(justnorm(optimizer_tensors[i][j], axes))
+                    changed = True
+                    changed_any = True
+        if changed:
+            tmp_optimizer._copy_main_params_to_model_params()
+
+    return changed_any
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func):
     """Single training step."""
     args = get_args()
@@ -1407,6 +1670,30 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
             
     timers('optimizer').stop()
+
+    if os.getenv('NGPT', 'false').lower() == 'true':
+        if args.use_distributed_optimizer:
+            # Synchronous distributed nGPT weight normalization:
+            # compute local SS on FP32 shards, all-reduce, normalize, copy to param buffer.
+            with torch.no_grad():
+                used_distributed_optimizer_norm = False
+                for tmp_optimizer in optimizer.chained_optimizers:
+                    if not hasattr(tmp_optimizer, 'shard_fp32_from_float16_groups'):
+                        continue  # only DistributedOptimizer instances have this
+                    _ngpt_weight_norm_distributed(model, tmp_optimizer, config)
+                    used_distributed_optimizer_norm = True
+                if used_distributed_optimizer_norm:
+                    _ngpt_log_weight_norm_path('distributed_optimizer_sharded_fp32')
+                else:
+                    raise RuntimeError(
+                        'NGPT=true with --use-distributed-optimizer but no DistributedOptimizer '
+                        'shards were found. Add a compatible nGPT normalization path.'
+                    )
+        else:
+            # Original non-distributed optimizer path.
+            with torch.no_grad():
+                _ngpt_log_weight_norm_path('full_params')
+                _ngpt_weight_norm_full_params(model, optimizer, config)
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks

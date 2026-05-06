@@ -1,5 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
+import os
 from collections import OrderedDict
 from typing import Dict, Literal, Optional
 
@@ -257,6 +257,11 @@ class GPTModel(LanguageModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+        
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            self.sz_init_value = 1.0
+            self.sz_init_scaling = config.init_method_std
+            self.sz = torch.nn.Parameter(self.sz_init_scaling * torch.ones(self.output_layer.weight.shape[0], dtype=torch.float32))
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
@@ -614,6 +619,10 @@ class GPTModel(LanguageModule):
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
+
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            sz = self.sz * (self.sz_init_value / self.sz_init_scaling)
+            logits = sz * logits
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:

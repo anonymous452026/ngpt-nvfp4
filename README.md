@@ -67,3 +67,32 @@ recipe = NVFP4BlockScaling(skip_amax=True, skip_amax_bwd_grad=False)
 ```
 
 Internally, each resolved `skip_amax` value is propagated into the corresponding NVFP4 `QParams`, then into `NVFP4Quantizer`. In C++, `NVFP4Quantizer::quantize()` passes `!skip_amax` as `compute_amax`, so `skip_amax=True` means the amax kernel is not launched and quantization uses the pre-initialized amax value of `1.0`.
+
+## NGPT+FNGPT toggles
+
+NGPT and FNGPT are controlled with environment variables, not Megatron-LM CLI flags.
+
+Enable the full NGPT+FNGPT path:
+
+```bash
+export NGPT=true
+export FNGPT=true
+```
+
+Optional NGPT/FNGPT-related environment variables:
+
+| Environment variable | Default | Controls |
+| --- | --- | --- |
+| `NGPT` | `false` | Enables nGPT behavior: layernorm bypass, `sqk`/`suv`/`sz`, SLERP residuals, and nGPT weight normalization. |
+| `FNGPT` | `false` | Enables fine-grained activation normalization in attention, MLP, MoE/shared-expert, and Mamba mixer paths. |
+| `NGPT_ALPHA_INIT` | `0.05` | Sets the initial residual interpolation alpha for NGPT transformer and Mamba SLERP paths. |
+| `NVTE_JUSTNORM_MODE` | `default` | Selects the L2 normalization implementation used by NGPT/FNGPT helpers. Use `triton` for fused Triton kernels; other supported paths include `default`, `compile`, and `fused`. |
+
+Example with fused Triton L2 normalization and a custom residual alpha:
+
+```bash
+export NGPT=true
+export FNGPT=true
+export NVTE_JUSTNORM_MODE=triton
+export NGPT_ALPHA_INIT=0.05
+```

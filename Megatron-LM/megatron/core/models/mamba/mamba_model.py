@@ -1,7 +1,9 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import os
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -147,6 +149,15 @@ class MambaModel(LanguageModule):
         if self.pre_process or self.post_process:
             self.setup_embeddings_and_output_layer()
 
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            self.sz_init_value = 1.0
+            self.sz_init_scaling = config.init_method_std
+            self.sz = torch.nn.Parameter(
+                self.sz_init_scaling * torch.ones(
+                    self.output_layer.weight.shape[0], dtype=torch.float32
+                )
+            )
+
         for name, module in self.named_modules():
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
@@ -270,6 +281,10 @@ class MambaModel(LanguageModule):
         logits, _ = self.output_layer(
             hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
         )
+
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            sz = self.sz * (self.sz_init_value / self.sz_init_scaling)
+            logits = sz * logits
 
         # Restore sequence parallel execution to the output layer if necessary.
         if sequence_parallel_override:

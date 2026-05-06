@@ -7,7 +7,9 @@
 
 import logging
 import math
+import os
 import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple, Union
 
@@ -30,6 +32,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.utils import (
+    distributed_justnorm,
     ensure_metadata_has_dp_cp_group,
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
@@ -395,6 +398,27 @@ class MambaMixer(MegatronModule):
         )
         self.tp_group = pg_collection.tp
 
+    def _out_proj_context(self):
+        """Return mxfp8 context for out_proj when keep_mamba_out_proj_in_mxfp8 is set,
+        otherwise nullcontext."""
+        if self.config.keep_mamba_out_proj_in_mxfp8 and (self.config.fp4 or self.config.fp8):
+            import transformer_engine.common.recipe
+            import transformer_engine.pytorch
+
+            fp8_format = transformer_engine.common.recipe.Format.HYBRID
+            mxfp8_recipe = transformer_engine.common.recipe.MXFP8BlockScaling(
+                fp8_format=fp8_format
+            )
+            fp8_group = None
+            if parallel_state.model_parallel_is_initialized():
+                fp8_group = parallel_state.get_amax_reduction_group(
+                    with_context_parallel=True, tp_only_amax_red=self.config.tp_only_amax_red
+                )
+            return transformer_engine.pytorch.fp8_autocast(
+                enabled=True, fp8_recipe=mxfp8_recipe, fp8_group=fp8_group
+            )
+        return nullcontext()
+
     def forward(
         self,
         hidden_states,
@@ -437,7 +461,11 @@ class MambaMixer(MegatronModule):
             assert ssm_state is None
             y = self.ssm_training(zxBCdt)
 
-        out, out_bias = self.out_proj(y)
+        if os.getenv('FNGPT', 'false').lower() == 'true':
+            y = distributed_justnorm(y, tp_group=self.tp_group)
+
+        with self._out_proj_context():
+            out, out_bias = self.out_proj(y)
 
         return out, out_bias
 
@@ -581,8 +609,12 @@ class MambaMixer(MegatronModule):
                 y_decode, y_prefill, context.mamba_metadata.device_decode_prefill, output_tensor=y
             )
 
+        if os.getenv('FNGPT', 'false').lower() == 'true':
+            y = distributed_justnorm(y, tp_group=self.tp_group)
+
         # Output projection
-        out, out_bias = self.out_proj(y)
+        with self._out_proj_context():
+            out, out_bias = self.out_proj(y)
 
         return out, out_bias
 
@@ -615,8 +647,12 @@ class MambaMixer(MegatronModule):
         if is_dynamic_batching:
             y = y.transpose(0, 1)
 
+        if os.getenv('FNGPT', 'false').lower() == 'true':
+            y = distributed_justnorm(y, tp_group=self.tp_group)
+
         # y has shape (1, b, d_inner), which is what out_proj expects
-        out, out_bias = self.out_proj(y)
+        with self._out_proj_context():
+            out, out_bias = self.out_proj(y)
 
         return out, out_bias
 

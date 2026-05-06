@@ -1,5 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-
+import os
 import logging
 import warnings
 from abc import ABC
@@ -31,6 +31,7 @@ from megatron.core.utils import (
     nvtx_range_pop,
     nvtx_range_push,
 )
+from megatron.core.transformer.utils import slerp_norm_with_alpha
 
 logger = logging.getLogger(__name__)
 
@@ -336,6 +337,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             hidden_size=self.config.hidden_size,
             eps=self.config.layernorm_epsilon,
         )
+
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            for p in self.input_layernorm.parameters():
+                p.requires_grad = False
+            for p in self.pre_mlp_layernorm.parameters():
+                p.requires_grad = False
+
         # [Module 8: MLP block]
         additional_mlp_kwargs = {}
         # import here to avoid circular import
@@ -452,6 +460,21 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
 
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            # NGPT_ALPHA_INIT: initial eigen learning rate per layer (default 0.05).
+            # nGPT paper recommends ~1/num_layers for deeper models.
+            alpha_init = float(os.getenv('NGPT_ALPHA_INIT', '0.05'))
+
+            self.attn_alpha_init_value = alpha_init
+            self.attn_alpha_init_scaling = config.init_method_std
+            self.attn_alpha = torch.nn.Parameter(self.attn_alpha_init_scaling * torch.ones(self.config.hidden_size, dtype=torch.float32))
+            self._attn_alpha_scale = self.attn_alpha_init_value / self.attn_alpha_init_scaling
+
+            self.mlp_alpha_init_value = alpha_init
+            self.mlp_alpha_init_scaling = config.init_method_std
+            self.mlp_alpha = torch.nn.Parameter(self.mlp_alpha_init_scaling * torch.ones(self.config.hidden_size, dtype=torch.float32))
+            self._mlp_alpha_scale = self.mlp_alpha_init_value / self.mlp_alpha_init_scaling
+
     @staticmethod
     def _get_layer_offset(config: TransformerConfig):
         """
@@ -531,14 +554,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
-        # Optional Input Layer norm
-        if self.recompute_input_layernorm:
-            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
-                self.input_layernorm, hidden_states
-            )
+        if os.getenv('NGPT', 'false').lower() == 'true': # NOTE: Disable all layernorms.
+            input_layernorm_output = hidden_states
         else:
-            input_layernorm_output = self.input_layernorm(hidden_states)
+            # Optional Input Layer norm
+            if self.recompute_input_layernorm:
+                self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
+                    self.input_layernorm, hidden_states
+                )
+            else:
+                input_layernorm_output = self.input_layernorm(hidden_states)
 
         using_fused_tp_inference_kernel = (not self.training) and (
             self.config.inference_fuse_tp_communication
@@ -565,51 +591,58 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         )
         nvtx_range_pop(suffix="self_attention")
 
-        if self.recompute_input_layernorm:
-            # discard the output of the input layernorm and register the recompute
-            # as a gradient hook of attention_output_with_bias[0]
-            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
-                attention_output_with_bias[0]
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            hidden_states = slerp_norm_with_alpha(
+                hidden_states, attention_output_with_bias[0],
+                self.attn_alpha, self._attn_alpha_scale
+            )
+            context = None
+        else:
+            if self.recompute_input_layernorm:
+                # discard the output of the input layernorm and register the recompute
+                # as a gradient hook of attention_output_with_bias[0]
+                self.input_layernorm_checkpoint.discard_output_and_register_recompute(
+                    attention_output_with_bias[0]
+                )
+
+            # TODO: could we move `bias_dropout_add_exec_handler` itself
+            # inside the module provided in the `bias_dropout_add_spec` module?
+            nvtx_range_push(suffix="self_attn_bda")
+            if using_fused_tp_inference_kernel:
+                # In inference optimized transformer layer, there is no bias and dropout
+                # The remaining residual add is already handled inside the
+                # self attention module.
+                hidden_states = attention_output_with_bias[0]
+            else:
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                        attention_output_with_bias, residual, self.hidden_dropout
+                    )
+            nvtx_range_pop(suffix="self_attn_bda")
+
+            # Residual connection.
+            residual = hidden_states
+
+            # Optional Layer norm after self-attention
+            pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
+
+            # Cross attention.
+            attention_output_with_bias = self.cross_attention(
+                pre_cross_attn_layernorm_output,
+                attention_mask=context_mask,
+                key_value_states=context,
+                inference_context=inference_context,
             )
 
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        nvtx_range_push(suffix="self_attn_bda")
-        if using_fused_tp_inference_kernel:
-            # In inference optimized transformer layer, there is no bias and dropout
-            # The remaining residual add is already handled inside the
-            # self attention module.
-            hidden_states = attention_output_with_bias[0]
-        else:
+            if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
+                context = attention_output_with_bias["context"]
+
+            # TODO: could we move `bias_dropout_add_exec_handler` itself
+            # inside the module provided in the `bias_dropout_add_spec` module?
             with self.bias_dropout_add_exec_handler():
-                hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
+                hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
                     attention_output_with_bias, residual, self.hidden_dropout
                 )
-        nvtx_range_pop(suffix="self_attn_bda")
-
-        # Residual connection.
-        residual = hidden_states
-
-        # Optional Layer norm after self-attention
-        pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
-
-        # Cross attention.
-        attention_output_with_bias = self.cross_attention(
-            pre_cross_attn_layernorm_output,
-            attention_mask=context_mask,
-            key_value_states=context,
-            inference_context=inference_context,
-        )
-
-        if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
-            context = attention_output_with_bias["context"]
-
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.hidden_dropout
-            )
 
         return hidden_states, context
 
@@ -627,14 +660,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
-        # Optional Layer norm post the cross-attention.
-        if self.recompute_pre_mlp_layernorm:
-            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
-                self.pre_mlp_layernorm, hidden_states
-            )
+        if os.getenv('NGPT', 'false').lower() == 'true': # NOTE: Disable all layernorms.
+            pre_mlp_layernorm_output = hidden_states
         else:
-            pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+            # Optional Layer norm post the cross-attention.
+            if self.recompute_pre_mlp_layernorm:
+                self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+                pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
+                    self.pre_mlp_layernorm, hidden_states
+                )
+            else:
+                pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
 
         nvtx_range_push(suffix="mlp")
         # Potentially chunk the MLP computation during prefill to minimize the peak activation size
@@ -723,24 +759,30 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
-        using_fused_tp_inference_kernel = (not self.training) and (
-            self.config.inference_fuse_tp_communication
-        )
-
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        nvtx_range_push(suffix="mlp_bda")
-        if using_fused_tp_inference_kernel:
-            # In inference optimized transformer layer, there is no bias and dropout
-            # The remaining residual add is already handled inside the
-            # MLP module.
-            hidden_states = mlp_output_with_bias[0]
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            hidden_states = slerp_norm_with_alpha(
+                residual, mlp_output_with_bias[0],
+                self.mlp_alpha, self._mlp_alpha_scale
+            )
         else:
-            with self.bias_dropout_add_exec_handler():
-                hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-                    mlp_output_with_bias, residual, self.hidden_dropout
-                )
-        nvtx_range_pop(suffix="mlp_bda")
+            using_fused_tp_inference_kernel = (not self.training) and (
+                self.config.inference_fuse_tp_communication
+            )
+
+            # TODO: could we move `bias_dropout_add_exec_handler` itself
+            # inside the module provided in the `bias_dropout_add_spec` module?
+            nvtx_range_push(suffix="mlp_bda")
+            if using_fused_tp_inference_kernel:
+                # In inference optimized transformer layer, there is no bias and dropout
+                # The remaining residual add is already handled inside the
+                # MLP module.
+                hidden_states = mlp_output_with_bias[0]
+            else:
+                with self.bias_dropout_add_exec_handler():
+                    hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
+                        mlp_output_with_bias, residual, self.hidden_dropout
+                    )
+            nvtx_range_pop(suffix="mlp_bda")
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,

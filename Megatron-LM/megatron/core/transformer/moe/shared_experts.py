@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import os
 import warnings
 from copy import deepcopy
 from typing import Optional
@@ -18,6 +19,7 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
+from megatron.core.transformer.utils import distributed_justnorm
 from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
@@ -187,6 +189,10 @@ class SharedExpertMLP(MLP):
             intermediate_parallel, bias_parallel = self.linear_fc1(self.cached_fc1_input)
             self.cached_fc1_input = None
 
+            if os.getenv('NGPT', 'false').lower() == 'true':
+                suv = (self.suv * ((self.suv_init_value / self.suv_init_scaling) * (self.config.hidden_size ** 0.5)))
+                intermediate_parallel = suv * intermediate_parallel
+
             if self.config.use_te_activation_func:
                 if bias_parallel is not None:
                     intermediate_parallel = intermediate_parallel + bias_parallel
@@ -220,6 +226,9 @@ class SharedExpertMLP(MLP):
                     intermediate_parallel = glu(intermediate_parallel)
                 else:
                     intermediate_parallel = self.activation_func(intermediate_parallel)
+
+            if os.getenv('FNGPT', 'false').lower() == 'true':
+                intermediate_parallel = distributed_justnorm(intermediate_parallel)
 
             self.cached_fc2_input = intermediate_parallel
 

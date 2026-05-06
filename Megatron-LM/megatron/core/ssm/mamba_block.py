@@ -5,6 +5,7 @@
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Tuple, Union
@@ -16,6 +17,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
+from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -118,8 +120,18 @@ class MambaStack(MegatronModule):
 
         self.layers = nn.ModuleList()
         for i, layer_type in enumerate(self.layer_type_list):
-            fp8_init_context = get_fp8_context(self.config, i + pp_layer_offset, is_init=True)
-            with fp8_init_context:
+            # Get appropriate quantization context (FP8 and FP4 are mutually exclusive)
+            if self.config.fp8:
+                quantization_init_context = get_fp8_context(
+                    self.config, i + pp_layer_offset, is_init=True
+                )
+            elif self.config.fp4:
+                quantization_init_context = get_fp4_context(
+                    self.config, i + pp_layer_offset, is_init=True
+                )
+            else:
+                quantization_init_context = nullcontext()
+            with quantization_init_context:
                 if layer_type == LayerSymbols.MAMBA:
                     layer = build_module(
                         submodules.mamba_layer,
@@ -157,7 +169,9 @@ class MambaStack(MegatronModule):
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
 
-        if self.post_process and self.post_layer_norm:
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            self.final_norm = None
+        elif self.post_process and self.post_layer_norm:
             # Final layer norm before output.
             self.final_norm = TENorm(
                 config=self.config,
@@ -268,18 +282,47 @@ class MambaStack(MegatronModule):
         # if we are using other fp8 recipes, then the context manager enter&exit are free
         # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
         # control which layer will be fp8 or bf16
-        use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
-        use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
-        outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
+        # For FP4: NVFP4BlockScaling doesn't have delayed scaling, always uses inner context
+        if self.config.fp8:
+            use_outer_quantization_context = self.config.fp8_recipe == Fp8Recipe.delayed
+            use_inner_quantization_context = self.config.fp8_recipe != Fp8Recipe.delayed
+            outer_quantization_context = (
+                get_fp8_context(self.config)
+                if use_outer_quantization_context
+                else nullcontext()
+            )
+        elif self.config.fp4:
+            use_outer_quantization_context = False
+            use_inner_quantization_context = True
+            outer_quantization_context = nullcontext()
+        else:
+            use_outer_quantization_context = False
+            use_inner_quantization_context = False
+            outer_quantization_context = nullcontext()
 
-        with outer_fp8_context:
+        with outer_quantization_context:
             for layer in self.layers:
-                inner_fp8_context = (
-                    get_fp8_context(self.config, layer.layer_number - 1)
-                    if use_inner_fp8_context
-                    else nullcontext()
+                # When keep_mamba_stack_attention_linear_in_bf16 is set,
+                # skip fp8/fp4 context for attention (TransformerLayer) layers
+                is_attention_layer = isinstance(layer, TransformerLayer)
+                skip_quant_for_attn = (
+                    is_attention_layer
+                    and self.config.keep_mamba_stack_attention_linear_in_bf16
                 )
-                with inner_fp8_context:
+                if use_inner_quantization_context and not skip_quant_for_attn:
+                    if self.config.fp8:
+                        inner_quantization_context = get_fp8_context(
+                            self.config, layer.layer_number - 1
+                        )
+                    elif self.config.fp4:
+                        inner_quantization_context = get_fp4_context(
+                            self.config, layer.layer_number - 1
+                        )
+                    else:
+                        inner_quantization_context = nullcontext()
+                else:
+                    inner_quantization_context = nullcontext()
+                with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):
                         hidden_states, _ = layer(
                             hidden_states=hidden_states,
@@ -302,7 +345,9 @@ class MambaStack(MegatronModule):
                     hidden_states = hidden_states[0]
 
         # Final layer norm.
-        if self.post_process and self.post_layer_norm:
+        if os.getenv('NGPT', 'false').lower() == 'true':
+            pass
+        elif self.post_process and self.post_layer_norm:
             hidden_states = self.final_norm(hidden_states)
 
         # Ensure that the tensor passed between pipeline parallel stages is
